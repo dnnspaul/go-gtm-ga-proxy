@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -14,247 +14,236 @@ import (
 	"github.com/tdewolff/minify/v2"
 )
 
-type gtmSourceCodeCache struct {
+// gtmCacheEntry holds a cached GTM JS response. It is always stored and
+// accessed via pointer so the embedded mutex is never copied.
+type gtmCacheEntry struct {
+	mu         sync.Mutex
 	lastUpdate int64
 	src        []byte
 	headers    http.Header
-	mux        sync.Mutex
 }
 
-var srcGtmCache = make(map[string]gtmSourceCodeCache)
-var gtmMapSync sync.Mutex
+var (
+	gtmCacheMu sync.RWMutex
+	gtmCache   = make(map[string]*gtmCacheEntry)
+)
+
+// getOrCreateGTMEntry returns the existing cache entry for key, or creates and
+// stores a new zeroed entry. The returned pointer is always valid.
+func getOrCreateGTMEntry(key string) *gtmCacheEntry {
+	gtmCacheMu.RLock()
+	entry, ok := gtmCache[key]
+	gtmCacheMu.RUnlock()
+	if ok {
+		return entry
+	}
+
+	gtmCacheMu.Lock()
+	defer gtmCacheMu.Unlock()
+	// Double-check after acquiring the write lock.
+	if entry, ok = gtmCache[key]; ok {
+		return entry
+	}
+	entry = &gtmCacheEntry{}
+	gtmCache[key] = entry
+	return entry
+}
 
 func googleTagManagerHandle(w http.ResponseWriter, r *http.Request, path string) {
-	var GtmContainerID string
-	var GtmURLAddition string
-	var GtmCookies []string
-	var GtmCache gtmSourceCodeCache
-
-	var sourceCodeToReturn []byte
-	var statusCodeToReturn int = 200
-	var headersToReturn http.Header
-	var usedCache bool
-	var endpointURI = settingsGGGP.EndpointURI
-
-	if settingsGGGP.EndpointURI == "" {
+	endpointURI := cfg.EndpointURI
+	if endpointURI == "" {
 		endpointURI = r.Host
 	}
 
-	if innerID, ok := r.URL.Query()[`id`]; ok {
-		if len(innerID[0]) >= 4 {
-			if innerID[0][:4] == `GTM-` {
-				GtmContainerID = innerID[0][4:]
-			} else {
-				GtmContainerID = innerID[0]
-			}
-		} else {
-			fmt.Println(`No correct get-parameter 'id' set.`)
-
-			w.Write([]byte(`No correct get-parameter 'id' set.`))
-
-			return
-		}
-	} else {
-		fmt.Println(`No get-parameter 'id' set.`)
-
-		w.Write([]byte(`No get-parameter 'id' set.`))
-
+	// Extract and normalise the GTM container ID from ?id=.
+	idParam, ok := r.URL.Query()["id"]
+	if !ok || len(idParam[0]) == 0 {
+		logger.Warn("GTM request missing 'id' query parameter")
+		http.Error(w, "missing 'id' query parameter", http.StatusBadRequest)
 		return
 	}
 
-	for URLKey, URLValue := range r.URL.Query() {
-		if URLKey != `id` {
-			GtmURLAddition = GtmURLAddition + `&` + URLKey + `=` + URLValue[0]
-		}
-	}
-
-	GtmCache, CacheExists := srcGtmCache[endpointURI+"/"+GtmContainerID+GtmURLAddition]
-
-	if CacheExists == false {
-		gtmMapSync.Lock()
-		srcGtmCache[endpointURI+"/"+GtmContainerID+GtmURLAddition] = gtmSourceCodeCache{lastUpdate: 0}
-		gtmMapSync.Unlock()
-
-		GtmCache, _ = srcGtmCache[endpointURI+"/"+GtmContainerID+GtmURLAddition]
-	}
-
-	if !isInSlice(settingsGGGP.AllowedGtmIds, r.URL.Query()[`id`][0]) && !isInSlice(settingsGGGP.AllowedGtmIds, r.URL.Query()[`id`][0][4:]) && settingsGGGP.RestrictGtmIds {
-		fmt.Println(`Tried to open disallowed GTM ID: ` + r.URL.Query()[`id`][0])
-
-		w.Write([]byte(`ID (` + r.URL.Query()[`id`][0] + `) needs to be whitelisted.`))
-		setResponseHeaders(w, headersToReturn)
-		w.WriteHeader(404)
-
+	containerID := idParam[0]
+	if strings.HasPrefix(containerID, "GTM-") {
+		containerID = containerID[4:]
+	} else if len(containerID) < 4 {
+		logger.Warn("GTM request has malformed 'id' parameter", "id", containerID)
+		http.Error(w, fmt.Sprintf("malformed 'id' parameter: %s", containerID), http.StatusBadRequest)
 		return
 	}
 
-	// Picking gtm_* Cookies
+	// Build extra URL query parameters (everything except 'id').
+	var extraParams strings.Builder
+	for key, vals := range r.URL.Query() {
+		if key != "id" {
+			extraParams.WriteString("&")
+			extraParams.WriteString(key)
+			extraParams.WriteString("=")
+			extraParams.WriteString(vals[0])
+		}
+	}
+	urlAddition := extraParams.String()
+
+	// Enforce container ID whitelist when configured.
+	rawID := idParam[0]
+	if cfg.RestrictGtmIds &&
+		!containsString(cfg.AllowedGtmIds, rawID) &&
+		!containsString(cfg.AllowedGtmIds, containerID) {
+		logger.Warn("blocked disallowed GTM container ID", "id", rawID)
+		http.Error(w, fmt.Sprintf("GTM ID %q is not allowed", rawID), http.StatusForbidden)
+		return
+	}
+
+	// Collect gtm_* cookies for GTM preview mode pass-through.
+	var gtmCookies []string
 	for _, cookie := range r.Cookies() {
-		name := []rune(cookie.Name)
-
-		if string(name[0:4]) == `gtm_` {
-			GtmCookies = append(GtmCookies, cookie.Name+`=`+cookie.Value)
+		if strings.HasPrefix(cookie.Name, "gtm_") {
+			gtmCookies = append(gtmCookies, cookie.Name+"="+cookie.Value)
 		}
 	}
 
-	if settingsGGGP.EnableDebugOutput {
-		fmt.Println(`Locking Cache MUX`)
-	}
+	cacheKey := endpointURI + "/" + containerID + urlAddition
+	entry := getOrCreateGTMEntry(cacheKey)
 
-	GtmCache.mux.Lock()
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
 
-	if settingsGGGP.EnableDebugOutput {
-		fmt.Println(`Locked Cache MUX`)
-	}
+	now := time.Now().Unix()
+	cacheValid := len(gtmCookies) == 0 && entry.lastUpdate > now-cfg.GtmCacheTime
 
-	if len(GtmCookies) == 0 && GtmCache.lastUpdate > (time.Now().Unix()-settingsGGGP.GtmCacheTime) {
-		if settingsGGGP.EnableDebugOutput {
-			fmt.Println(`Unlocking Cache MUX (Cache)`)
+	var (
+		body        []byte
+		respHeaders http.Header
+		statusCode  = http.StatusOK
+		usedCache   bool
+	)
+
+	if cacheValid {
+		if cfg.EnableDebugOutput {
+			logger.Debug("GTM JS served from cache", "containerID", containerID)
 		}
-		GtmCache.mux.Unlock()
-		if settingsGGGP.EnableDebugOutput {
-			fmt.Println(`Unlocked Cache MUX (Cache)`)
-		}
-
-		sourceCodeToReturn = GtmCache.src
-		headersToReturn = GtmCache.headers
+		body = entry.src
+		respHeaders = entry.headers
 		usedCache = true
 	} else {
-		client := &http.Client{}
-		var req *http.Request
-		var err error
-
+		var upstream string
 		switch path {
-		case `default`:
-			if settingsGGGP.EnableDebugOutput {
-				fmt.Println(`Requesting: https://www.googletagmanager.com/gtm.js?id=GTM-` + GtmContainerID + GtmURLAddition)
-			}
-
-			req, err = http.NewRequest(`GET`, `https://www.googletagmanager.com/gtm.js?id=GTM-`+GtmContainerID+GtmURLAddition, nil)
-		case `default_a`:
-			if settingsGGGP.EnableDebugOutput {
-				fmt.Println(`Requesting: https://www.googletagmanager.com/a?id=GTM-` + GtmContainerID + GtmURLAddition)
-			}
-
-			req, err = http.NewRequest(`GET`, `https://www.googletagmanager.com/a?id=GTM-`+GtmContainerID+GtmURLAddition, nil)
-		case `gtag`:
-			if settingsGGGP.EnableDebugOutput {
-				fmt.Println(`Requesting: https://www.googletagmanager.com/gtag/js?id=` + GtmContainerID + GtmURLAddition)
-			}
-
-			req, err = http.NewRequest(`GET`, `https://www.googletagmanager.com/gtag/js?id=`+GtmContainerID+GtmURLAddition, nil)
-		}
-
-		if err != nil {
-			fmt.Println(`Experienced problems on requesting gtm.js from google. Aborting.`)
-
+		case "default":
+			upstream = "https://www.googletagmanager.com/gtm.js?id=GTM-" + containerID + urlAddition
+		case "default_a":
+			upstream = "https://www.googletagmanager.com/a?id=GTM-" + containerID + urlAddition
+		case "gtag":
+			upstream = "https://www.googletagmanager.com/gtag/js?id=" + containerID + urlAddition
+		default:
+			logger.Warn("unknown GTM path variant", "path", path)
+			http.Error(w, "unknown GTM path", http.StatusBadRequest)
 			return
 		}
 
-		req.Header.Set(`User-Agent`, `GoGtmGaProxy `+os.Getenv(`APP_VERSION`)+`; github.com/blaumedia/go-gtm-ga-proxy`)
-
-		// Redirect gtm_* cookies to GTM for preview mode
-		req.Header.Set(`Cookie`, strings.Join(GtmCookies, `; `))
-
-		resp, err := client.Do(req)
-		if err != nil {
-			fmt.Println(`Experienced problems on requesting gtm.js from google. Aborting.`)
-
-			return
+		if cfg.EnableDebugOutput {
+			logger.Debug("fetching GTM JS from upstream", "url", upstream)
 		}
 
+		req, err := http.NewRequest(http.MethodGet, upstream, nil)
+		if err != nil {
+			logger.Error("failed to create GTM upstream request", "err", err)
+			http.Error(w, "upstream request error", http.StatusBadGateway)
+			return
+		}
+		req.Header.Set("User-Agent", "GoGtmGaProxy "+os.Getenv("APP_VERSION")+"; github.com/blaumedia/go-gtm-ga-proxy")
+		if len(gtmCookies) > 0 {
+			req.Header.Set("Cookie", strings.Join(gtmCookies, "; "))
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			logger.Error("GTM upstream request failed", "err", err)
+			http.Error(w, "upstream request failed", http.StatusBadGateway)
+			return
+		}
 		defer resp.Body.Close()
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			fmt.Println(`Experienced problems on requesting gtm.js from google. Aborting.`)
 
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			logger.Error("failed to read GTM upstream response body", "err", err)
+			http.Error(w, "failed to read upstream response", http.StatusBadGateway)
 			return
 		}
 
-		// It seems like the /a endpoint returns a pixel instead of js code. Temporarily disable proxying for it.
-		// re := regexp.MustCompile(`www.googletagmanager.com\/a`)
-		// body = re.ReplaceAll([]byte(body), []byte(settingsGGGP.EndpointURI+`/`+settingsGGGP.JsSubdirectory+`/`+settingsGGGP.GtmAFilename))
+		body = rewriteGTMBody(body, endpointURI)
 
-		re := regexp.MustCompile(`(www\.)?googletagmanager.com`)
-		body = re.ReplaceAll([]byte(body), []byte(endpointURI))
-
-		re = regexp.MustCompile(endpointURI + `\/a`)
-		body = re.ReplaceAll([]byte(body), []byte(`www.googletagmanager.com\/a`))
-
-		re = regexp.MustCompile(`\/gtm.js`)
-		body = re.ReplaceAll([]byte(body), []byte(`/`+settingsGGGP.JsSubdirectory+`/`+settingsGGGP.GtmFilename))
-
-		re = regexp.MustCompile(`www.google-analytics.com`)
-		body = re.ReplaceAll([]byte(body), []byte(endpointURI))
-
-		re = regexp.MustCompile(`(\/)?analytics.js`)
-		body = re.ReplaceAll([]byte(body), []byte(`/`+settingsGGGP.JsSubdirectory+`/`+settingsGGGP.GaFilename))
-
-		re = regexp.MustCompile(`u\/analytics_debug.js`)
-		body = re.ReplaceAll([]byte(body), []byte(`/`+settingsGGGP.JsSubdirectory+`/`+settingsGGGP.GaDebugFilename))
-
-		re = regexp.MustCompile(`\/gtag\/js`)
-		body = re.ReplaceAll([]byte(body), []byte(`/`+settingsGGGP.JsSubdirectory+`/`+settingsGGGP.GtagFilename))
-
-		if settingsGGGP.JsEnableMinify {
-			m := minify.New()
-			m.AddCmd(`application/javascript`, exec.Command("uglifyjs"))
-
-			var previousLengthOfJs int
-			if settingsGGGP.EnableDebugOutput {
-				previousLengthOfJs = len(body)
-			}
-
-			body, err = m.Bytes(`application/javascript`, body)
+		if cfg.JsEnableMinify {
+			body, err = minifyJS(body)
 			if err != nil {
-				panic(err)
-			}
-
-			if settingsGGGP.EnableDebugOutput {
-				afterLengthOfJs := len(body)
-				compressChange := fmt.Sprintf(`%f`, (float64(previousLengthOfJs-afterLengthOfJs)/float64(previousLengthOfJs))*float64(100))
-				fmt.Println(`Compressed the Google Tag Manager JS File of ID ` + GtmContainerID + ` and reduced it by ` + compressChange + `%.`)
+				logger.Error("JS minification failed", "err", err)
+				// Non-fatal: serve unminified body.
+			} else if cfg.EnableDebugOutput {
+				logger.Debug("GTM JS minified", "containerID", containerID)
 			}
 		}
 
-		if resp.StatusCode == 200 && len(GtmCookies) == 0 {
-			GtmCache.headers = resp.Header
-			GtmCache.src = body
-			GtmCache.lastUpdate = time.Now().Unix()
-		}
+		statusCode = resp.StatusCode
+		respHeaders = resp.Header
 
-		headersToReturn = resp.Header
-		statusCodeToReturn = resp.StatusCode
-		sourceCodeToReturn = body
+		// Only cache clean (non-preview) successful responses.
+		if resp.StatusCode == http.StatusOK && len(gtmCookies) == 0 {
+			entry.src = body
+			entry.headers = resp.Header
+			entry.lastUpdate = now
+		}
 		usedCache = false
-
-		if settingsGGGP.EnableDebugOutput {
-			fmt.Println(`Unlocking Cache MUX (Cache)`)
-		}
-		GtmCache.mux.Unlock()
-		if settingsGGGP.EnableDebugOutput {
-			fmt.Println(`Unlocked Cache MUX (Cache)`)
-		}
-
-		// Reassigning the copy of the struct back to map
-		gtmMapSync.Lock()
-		srcGtmCache[endpointURI+"/"+GtmContainerID+GtmURLAddition] = GtmCache
-		gtmMapSync.Unlock()
 	}
 
-	setResponseHeaders(w, headersToReturn)
-
+	setResponseHeaders(w, respHeaders)
 	if usedCache {
-		w.Header().Add(`X-Cache-Hit`, `true`)
+		w.Header().Set("X-Cache-Hit", "true")
 	} else {
-		w.Header().Add(`X-Cache-Hit`, `false`)
+		w.Header().Set("X-Cache-Hit", "false")
 	}
 
-	for _, f := range settingsGGGP.pluginEngine.dispatcher[`after_gtm_js`] {
-		f(&w, r, &statusCodeToReturn, &sourceCodeToReturn)
+	// Run registered post-GTM-JS hooks.
+	for _, hook := range cfg.pluginEngine.dispatcher["after_gtm_js"] {
+		hook(&w, r, &statusCode, &body)
 	}
 
-	w.WriteHeader(statusCodeToReturn)
+	w.WriteHeader(statusCode)
+	w.Write(body) //nolint:errcheck
+}
 
-	w.Write([]byte(sourceCodeToReturn))
+// rewriteGTMBody performs all URL-rewriting substitutions on the raw GTM JS body.
+func rewriteGTMBody(body []byte, endpointURI string) []byte {
+	// Replace all googletagmanager.com references with the proxy host.
+	body = regexp.MustCompile(`(www\.)?googletagmanager\.com`).ReplaceAll(body, []byte(endpointURI))
+
+	// The /a endpoint serves a tracking pixel – keep it pointing at Google.
+	body = regexp.MustCompile(regexp.QuoteMeta(endpointURI)+`/a`).
+		ReplaceAll(body, []byte(`www.googletagmanager.com/a`))
+
+	body = regexp.MustCompile(`/gtm\.js`).
+		ReplaceAll(body, []byte("/"+cfg.JsSubdirectory+"/"+cfg.GtmFilename))
+
+	body = regexp.MustCompile(`www\.google-analytics\.com`).
+		ReplaceAll(body, []byte(endpointURI))
+
+	body = regexp.MustCompile(`(/?)(analytics\.js)`).
+		ReplaceAll(body, []byte("/"+cfg.JsSubdirectory+"/"+cfg.GaFilename))
+
+	body = regexp.MustCompile(`u/analytics_debug\.js`).
+		ReplaceAll(body, []byte("/"+cfg.JsSubdirectory+"/"+cfg.GaDebugFilename))
+
+	body = regexp.MustCompile(`/gtag/js`).
+		ReplaceAll(body, []byte("/"+cfg.JsSubdirectory+"/"+cfg.GtagFilename))
+
+	// Rewrite GA4 collect endpoint so hits are routed through the proxy.
+	body = regexp.MustCompile(`"/g/collect`).
+		ReplaceAll(body, []byte(`"`+cfg.Ga4CollectEndpoint))
+
+	return body
+}
+
+// minifyJS runs the body through uglifyjs via the tdewolff/minify adapter.
+func minifyJS(body []byte) ([]byte, error) {
+	m := minify.New()
+	m.AddCmd("application/javascript", exec.Command("uglifyjs"))
+	return m.Bytes("application/javascript", body)
 }

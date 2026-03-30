@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,15 +11,20 @@ import (
 	"strings"
 )
 
-// GaCookieVersion is the cookie version in the _ga cookie
+// GaCookieVersion is the version prefix embedded in generated _ga cookie values.
 const GaCookieVersion = "1"
 
+// HookFunc is the signature for plugin hook functions.
+type HookFunc func(*http.ResponseWriter, *http.Request, *int, *[]byte)
+
+// pluginSystem holds loaded plugins and their registered event hooks.
 type pluginSystem struct {
 	plugins    []*plugin.Plugin
-	dispatcher map[string][]func(*http.ResponseWriter, *http.Request, *int, *[]byte)
+	dispatcher map[string][]HookFunc
 }
 
-type settingsStruct struct {
+// config holds all runtime configuration derived from environment variables.
+type config struct {
 	EnableDebugOutput         bool
 	EndpointURI               string
 	JsSubdirectory            string
@@ -34,6 +40,7 @@ type settingsStruct struct {
 	GaCollectEndpoint         string
 	GaCollectEndpointRedirect string
 	GaCollectEndpointJ        string
+	Ga4CollectEndpoint        string
 	RestrictGtmIds            bool
 	AllowedGtmIds             []string
 	EnableServerSideGaCookies bool
@@ -45,9 +52,46 @@ type settingsStruct struct {
 	pluginEngine              pluginSystem
 }
 
-var settingsGGGP settingsStruct
+// cfg is the package-level configuration, populated once at startup.
+var cfg config
 
-func isInSlice(slice []string, val string) bool {
+// logger is the structured logger used throughout the application.
+var logger *slog.Logger
+
+// envBool returns true when the named environment variable is "true" or "1" (case-insensitive).
+func envBool(name string) bool {
+	v := strings.ToLower(os.Getenv(name))
+	return v == "true" || v == "1"
+}
+
+// envInt64 parses the named environment variable as a base-10 int64.
+// Returns 0 when the variable is unset. Logs a warning only when the
+// variable is set but cannot be parsed as an integer.
+func envInt64(name string) int64 {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return 0
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		logger.Warn("could not parse environment variable as int64", "name", name, "value", raw)
+	}
+	return v
+}
+
+// envRequired returns the value of the named environment variable or exits the
+// process with a clear error message when the variable is unset or empty.
+func envRequired(name string) string {
+	v := os.Getenv(name)
+	if v == "" {
+		logger.Error("required environment variable is missing", "name", name)
+		os.Exit(1)
+	}
+	return v
+}
+
+// containsString reports whether val is present in slice.
+func containsString(slice []string, val string) bool {
 	for _, item := range slice {
 		if item == val {
 			return true
@@ -56,51 +100,70 @@ func isInSlice(slice []string, val string) bool {
 	return false
 }
 
-func javascriptFilesHandle(w http.ResponseWriter, r *http.Request) {
-	switch r.URL.Path {
-	case `/` + settingsGGGP.JsSubdirectory + `/` + settingsGGGP.GtmFilename:
-		googleTagManagerHandle(w, r, `default`)
-	case `/` + settingsGGGP.JsSubdirectory + `/` + settingsGGGP.GtmAFilename:
-		googleTagManagerHandle(w, r, `default_a`)
-	case `/` + settingsGGGP.JsSubdirectory + `/` + settingsGGGP.GtagFilename:
-		googleTagManagerHandle(w, r, `gtag`)
-	case `/` + settingsGGGP.JsSubdirectory + `/` + settingsGGGP.GaFilename:
-		googleAnalyticsJsHandle(w, r, `default`)
-	case `/` + settingsGGGP.JsSubdirectory + `/` + settingsGGGP.GaDebugFilename:
-		googleAnalyticsJsHandle(w, r, `debug`)
-	default:
-		if r.URL.Path[:len(settingsGGGP.JsSubdirectory+settingsGGGP.GaPluginsDirectoryname)+3] == `/`+settingsGGGP.JsSubdirectory+`/`+settingsGGGP.GaPluginsDirectoryname+`/` {
-			googleAnalyticsJsHandle(w, r, r.URL.Path)
-		} else {
-			fmt.Println(`###################################`)
-			fmt.Println(`404 Page accessed: ` + r.URL.Path)
-			fmt.Println(`###################################`)
-			w.WriteHeader(http.StatusNotFound)
-			w.Write([]byte(`Not found`))
+// setResponseHeaders copies a curated set of upstream headers to the client
+// response and appends the X-Powered-By header.
+func setResponseHeaders(w http.ResponseWriter, headers http.Header) {
+	allowed := map[string]struct{}{
+		"Age":           {},
+		"Cache-Control": {},
+		"Content-Type":  {},
+		"Date":          {},
+		"Expires":       {},
+		"Last-Modified": {},
+	}
+	for name, values := range headers {
+		if _, ok := allowed[name]; ok {
+			w.Header().Set(name, values[0])
 		}
 	}
-	return
+	w.Header().Set("X-Powered-By", "GoGtmGaProxy "+os.Getenv("APP_VERSION"))
 }
 
+// javascriptFilesHandle routes JS-file requests to the appropriate handler.
+func javascriptFilesHandle(w http.ResponseWriter, r *http.Request) {
+	p := r.URL.Path
+	jsDir := "/" + cfg.JsSubdirectory + "/"
+	pluginPrefix := jsDir + cfg.GaPluginsDirectoryname + "/"
+
+	switch p {
+	case jsDir + cfg.GtmFilename:
+		googleTagManagerHandle(w, r, "default")
+	case jsDir + cfg.GtmAFilename:
+		googleTagManagerHandle(w, r, "default_a")
+	case jsDir + cfg.GtagFilename:
+		googleTagManagerHandle(w, r, "gtag")
+	case jsDir + cfg.GaFilename:
+		googleAnalyticsJsHandle(w, r, "default")
+	case jsDir + cfg.GaDebugFilename:
+		googleAnalyticsJsHandle(w, r, "debug")
+	default:
+		if strings.HasPrefix(p, pluginPrefix) {
+			googleAnalyticsJsHandle(w, r, p)
+		} else {
+			logger.Warn("404 - unknown path accessed", "path", p)
+			http.Error(w, "Not found", http.StatusNotFound)
+		}
+	}
+}
+
+// collectHandle routes collect-endpoint requests to the UA GA handler.
 func collectHandle(w http.ResponseWriter, r *http.Request) {
 	googleAnalyticsCollectHandle(w, r)
 }
 
-func setResponseHeaders(w http.ResponseWriter, headers http.Header) {
-	// Looping through headers from request
-	for headerName, headerValue := range headers {
-		// Picking and sending relevant headers to client
-		if headerName == `Age` || headerName == `Cache-Control` || headerName == `Content-Type` || headerName == `Date` || headerName == `Expires` || headerName == `Last-Modified` {
-			w.Header().Set(headerName, headerValue[0])
-		}
-	}
-
-	w.Header().Set(`X-Powered-By`, `GoGtmGaProxy `+os.Getenv(`APP_VERSION`))
+// ga4CollectHandle routes collect-endpoint requests to the GA4 handler.
+func ga4CollectHandle(w http.ResponseWriter, r *http.Request) {
+	googleAnalytics4CollectHandle(w, r)
 }
 
 func main() {
-	// Check if required environment variables are set
-	for _, envVar := range [...]string{
+	// Initialise structured logger (text format for human-readable container logs).
+	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+
+	// Validate and load all required environment variables.
+	requiredVars := []string{
 		"JS_SUBDIRECTORY",
 		"GA_PLUGINS_DIRECTORYNAME",
 		"GTM_FILENAME",
@@ -111,126 +174,108 @@ func main() {
 		"GA_COLLECT_ENDPOINT",
 		"GA_COLLECT_REDIRECT_ENDPOINT",
 		"GA_COLLECT_J_ENDPOINT",
-	} {
-		if os.Getenv(envVar) == `` {
-			fmt.Println(`ERROR: Seems the required environment variable '` + envVar + `' is missing. Exiting.`)
+		"GA4_COLLECT_ENDPOINT",
+	}
+	for _, v := range requiredVars {
+		envRequired(v)
+	}
+
+	cfg = config{
+		EnableDebugOutput:         envBool("ENABLE_DEBUG_OUTPUT"),
+		EndpointURI:               os.Getenv("ENDPOINT_URI"),
+		JsSubdirectory:            os.Getenv("JS_SUBDIRECTORY"),
+		GaCacheTime:               envInt64("GA_CACHE_TIME"),
+		GtmCacheTime:              envInt64("GTM_CACHE_TIME"),
+		JsEnableMinify:            envBool("JS_MINIFY"),
+		GtmFilename:               os.Getenv("GTM_FILENAME"),
+		GtmAFilename:              os.Getenv("GTM_A_FILENAME"),
+		GaFilename:                os.Getenv("GA_FILENAME"),
+		GaDebugFilename:           os.Getenv("GADEBUG_FILENAME"),
+		GaPluginsDirectoryname:    os.Getenv("GA_PLUGINS_DIRECTORYNAME"),
+		GtagFilename:              os.Getenv("GTAG_FILENAME"),
+		GaCollectEndpoint:         os.Getenv("GA_COLLECT_ENDPOINT"),
+		GaCollectEndpointRedirect: os.Getenv("GA_COLLECT_REDIRECT_ENDPOINT"),
+		GaCollectEndpointJ:        os.Getenv("GA_COLLECT_J_ENDPOINT"),
+		Ga4CollectEndpoint:        os.Getenv("GA4_COLLECT_ENDPOINT"),
+		RestrictGtmIds:            envBool("RESTRICT_GTM_IDS"),
+		AllowedGtmIds:             strings.Split(os.Getenv("GTM_IDS"), ","),
+		EnableServerSideGaCookies: envBool("ENABLE_SERVER_SIDE_GA_COOKIES"),
+		ServerSideGaCookieName:    os.Getenv("GA_SERVER_SIDE_COOKIE"),
+		CookieDomain:              os.Getenv("COOKIE_DOMAIN"),
+		CookieSecure:              envBool("COOKIE_SECURE"),
+		ClientSideGaCookieName:    "_ga",
+		PluginsEnabled:            envBool("ENABLE_PLUGINS"),
+		pluginEngine: pluginSystem{
+			dispatcher: make(map[string][]HookFunc),
+		},
+	}
+
+	// Allow overriding the client-side GA cookie name.
+	if v := os.Getenv("GA_CLIENT_SIDE_COOKIE"); v != "" {
+		cfg.ClientSideGaCookieName = v
+	}
+
+	// Load plugins if enabled.
+	if cfg.PluginsEnabled {
+		if err := loadPlugins("/app/plugins"); err != nil {
+			logger.Error("failed to load plugins", "err", err)
 			os.Exit(1)
 		}
 	}
 
-	settingsGGGP.EndpointURI = os.Getenv(`ENDPOINT_URI`)
-	settingsGGGP.JsSubdirectory = os.Getenv(`JS_SUBDIRECTORY`)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/"+cfg.JsSubdirectory+"/", javascriptFilesHandle)
+	mux.HandleFunc(cfg.GaCollectEndpoint, collectHandle)
+	mux.HandleFunc(cfg.GaCollectEndpointRedirect, collectHandle)
+	mux.HandleFunc(cfg.GaCollectEndpointJ, collectHandle)
+	mux.HandleFunc(cfg.Ga4CollectEndpoint, ga4CollectHandle)
 
-	settingsGGGP.GaCacheTime, _ = strconv.ParseInt(os.Getenv(`GA_CACHE_TIME`), 10, 64)
-	settingsGGGP.GtmCacheTime, _ = strconv.ParseInt(os.Getenv(`GTM_CACHE_TIME`), 10, 64)
+	addr := ":8080"
+	logger.Info("server starting", "addr", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		logger.Error("server exited with error", "err", err)
+		os.Exit(1)
+	}
+}
 
-	settingsGGGP.GtmFilename = os.Getenv(`GTM_FILENAME`)
-	settingsGGGP.GtmAFilename = os.Getenv(`GTM_A_FILENAME`)
-	settingsGGGP.GaFilename = os.Getenv(`GA_FILENAME`)
-	settingsGGGP.GtagFilename = os.Getenv(`GTAG_FILENAME`)
-	settingsGGGP.GaDebugFilename = os.Getenv(`GADEBUG_FILENAME`)
-
-	settingsGGGP.GaPluginsDirectoryname = os.Getenv(`GA_PLUGINS_DIRECTORYNAME`)
-
-	settingsGGGP.GaCollectEndpoint = os.Getenv(`GA_COLLECT_ENDPOINT`)
-	settingsGGGP.GaCollectEndpointRedirect = os.Getenv(`GA_COLLECT_REDIRECT_ENDPOINT`)
-	settingsGGGP.GaCollectEndpointJ = os.Getenv(`GA_COLLECT_J_ENDPOINT`)
-
-	settingsGGGP.AllowedGtmIds = strings.Split(os.Getenv(`GTM_IDS`), `,`)
-
-	settingsGGGP.ServerSideGaCookieName = os.Getenv(`GA_SERVER_SIDE_COOKIE`)
-	settingsGGGP.CookieDomain = os.Getenv(`COOKIE_DOMAIN`)
-	settingsGGGP.ClientSideGaCookieName = `_ga`
-
-	settingsGGGP.pluginEngine = pluginSystem{
-		dispatcher: make(map[string][]func(*http.ResponseWriter, *http.Request, *int, *[]byte)),
+// loadPlugins walks dir, opens every .so file as a Go plugin, calls its Main()
+// function, and registers all hooks from its Dispatcher map.
+func loadPlugins(dir string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return fmt.Errorf("plugins directory %q does not exist – use the plugin-enabled image or set ENABLE_PLUGINS=false", dir)
 	}
 
-	// Replace ClientSideGaCookieName if environment variable is set
-	if os.Getenv(`GA_CLIENT_SIDE_COOKIE`) != `` {
-		settingsGGGP.ClientSideGaCookieName = os.Getenv(`GA_CLIENT_SIDE_COOKIE`)
-	}
-
-	if strings.ToLower(os.Getenv(`ENABLE_DEBUG_OUTPUT`)) == `true` || strings.ToLower(os.Getenv(`ENABLE_DEBUG_OUTPUT`)) == `1` {
-		settingsGGGP.EnableDebugOutput = true
-	}
-
-	if strings.ToLower(os.Getenv(`JS_MINIFY`)) == `true` || strings.ToLower(os.Getenv(`JS_MINIFY`)) == `1` {
-		settingsGGGP.JsEnableMinify = true
-	}
-
-	if strings.ToLower(os.Getenv(`ENABLE_SERVER_SIDE_GA_COOKIES`)) == `true` || strings.ToLower(os.Getenv(`ENABLE_SERVER_SIDE_GA_COOKIES`)) == `1` {
-		settingsGGGP.EnableServerSideGaCookies = true
-	}
-
-	if strings.ToLower(os.Getenv(`RESTRICT_GTM_IDS`)) == `true` || strings.ToLower(os.Getenv(`RESTRICT_GTM_IDS`)) == `1` {
-		settingsGGGP.RestrictGtmIds = true
-	}
-
-	if strings.ToLower(os.Getenv(`COOKIE_SECURE`)) == `true` || strings.ToLower(os.Getenv(`COOKIE_SECURE`)) == `1` {
-		settingsGGGP.CookieSecure = true
-	}
-
-	if strings.ToLower(os.Getenv(`ENABLE_PLUGINS`)) == `true` || strings.ToLower(os.Getenv(`ENABLE_PLUGINS`)) == `1` {
-		settingsGGGP.PluginsEnabled = true
-	}
-
-	if settingsGGGP.PluginsEnabled {
-		_, err := os.Stat(`/app/plugins`)
-
-		if os.IsNotExist(err) == false {
-			err := filepath.Walk(`./plugins/`, func(path string, info os.FileInfo, _ error) error {
-				if info.IsDir() == false && info.Name()[len(info.Name())-2:] == "so" {
-					fmt.Println(`/app/plugins/` + info.Name())
-					p, err := plugin.Open(`/app/plugins/` + info.Name())
-
-					if err != nil {
-						fmt.Println(`ERROR: Failure on opening plugin!`)
-						panic(err)
-					}
-
-					mainFunc, err := p.Lookup(`Main`)
-
-					if err != nil {
-						fmt.Println(`ERROR: Failure on starting main routine of plugin!`)
-						panic(err)
-					}
-
-					mainFunc.(func())()
-
-					pluginDispatcher, err := p.Lookup(`Dispatcher`)
-
-					if err != nil {
-						fmt.Println(`ERROR: Failure on reading Dispatcher of plugin!`)
-						panic(err)
-					}
-
-					for k, v := range *pluginDispatcher.(*map[string][]func(*http.ResponseWriter, *http.Request, *int, *[]byte)) {
-						for _, f := range v {
-							settingsGGGP.pluginEngine.dispatcher[k] = append(settingsGGGP.pluginEngine.dispatcher[k], f)
-						}
-					}
-				}
-				return nil
-			})
-
-			if err != nil {
-				fmt.Println(`ERROR: Failure on opening plugin!`)
-				panic(err)
-			}
-		} else {
-			fmt.Println(`ERROR: plugins-directory doesn't exist! Did you pick the right docker image that is made for plugin usage or did you forget to disable ENABLE_PLUGINS environment variable while switching images?`)
-			os.Exit(1)
+	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
-	}
+		if info.IsDir() || !strings.HasSuffix(info.Name(), ".so") {
+			return nil
+		}
 
-	http.HandleFunc(`/`+settingsGGGP.JsSubdirectory+`/`, javascriptFilesHandle)
+		logger.Info("loading plugin", "path", path)
+		p, err := plugin.Open(path)
+		if err != nil {
+			return fmt.Errorf("open plugin %q: %w", path, err)
+		}
 
-	http.HandleFunc(settingsGGGP.GaCollectEndpoint, collectHandle)
-	http.HandleFunc(settingsGGGP.GaCollectEndpointRedirect, collectHandle)
-	http.HandleFunc(settingsGGGP.GaCollectEndpointJ, collectHandle)
+		mainSym, err := p.Lookup("Main")
+		if err != nil {
+			return fmt.Errorf("plugin %q missing Main symbol: %w", path, err)
+		}
+		mainSym.(func())()
 
-	if err := http.ListenAndServe(`:8080`, nil); err != nil {
-		panic(err)
-	}
+		dispatcherSym, err := p.Lookup("Dispatcher")
+		if err != nil {
+			return fmt.Errorf("plugin %q missing Dispatcher symbol: %w", path, err)
+		}
+
+		dispatcher := *dispatcherSym.(*map[string][]HookFunc)
+		for event, hooks := range dispatcher {
+			cfg.pluginEngine.dispatcher[event] = append(cfg.pluginEngine.dispatcher[event], hooks...)
+		}
+
+		cfg.pluginEngine.plugins = append(cfg.pluginEngine.plugins, p)
+		return nil
+	})
 }
