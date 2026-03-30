@@ -29,7 +29,7 @@ To prevent tracking, blockers try to block the URLs of www.googletagmanager.com 
 - Chrome Extension for the trouble-free use of the Google Tag Manager preview mode (see [Chrome Extension](#chrome-extension) for the why)
 - High performant and full RFC compliant thanks to Go and [net/http](https://golang.org/pkg/net/http/)
 - JS minifier for optimizations of up to 30% (thanks to [tdewolff/minify](https://github.com/tdewolff/minify) and [mishoo/UglifyJS](https://github.com/mishoo/UglifyJS))
-- Small 20MB [ready-2-use](https://hub.docker.com/repository/docker/blaumedia/go-gtm-ga-proxy) docker image for crazy fast deployments, updates and close-to-zero harddrive occupation
+- Small ready-2-use [docker image on GHCR](https://ghcr.io/dnnspaul/go-gtm-ga-proxy) (`linux/amd64`) for fast deployments and close-to-zero disk usage
 - Many environment variables to adjust the proxy exactly to your needs
 - Expandable through [Plugins](#plugins)
 
@@ -55,6 +55,7 @@ docker run \
     -e GA_COLLECT_ENDPOINT=/fetch \
     -e GA_COLLECT_REDIRECT_ENDPOINT=/fetch_r \
     -e GA_COLLECT_J_ENDPOINT=/fetch_j \
+    -e GA4_COLLECT_ENDPOINT=/g/fetch \
     -e PROXY_IP_HEADER=X-Forwarded-For \
     -e PROXY_IP_HEADER_INDEX=0 \
     -e ENABLE_SERVER_SIDE_GA_COOKIES=true \
@@ -63,7 +64,7 @@ docker run \
     -e COOKIE_DOMAIN=yourdomain.tld \
     -e COOKIE_SECURE=true \
     -p "8080:8080" \
-    blaumedia/go-gtm-ga-proxy:1.0.2
+    ghcr.io/dnnspaul/go-gtm-ga-proxy:latest
 ```
 
 
@@ -86,6 +87,7 @@ docker run \
 |```GA_COLLECT_ENDPOINT```|Set the new name for the /collect endpoint.|/fetch|
 |```GA_COLLECT_REDIRECT_ENDPOINT```|Set the new name for the /r/collect endpoint.|/fetch_r|
 |```GA_COLLECT_J_ENDPOINT```|Set the new name for the /j/collect endpoint. Couldn't find out yet for what this endpoint is. If you know more, please share! :)|/fetch_j|
+|```GA4_COLLECT_ENDPOINT```|Set the obfuscated path for the GA4 Measurement Protocol `/g/collect` endpoint. Required for GA4 data collection to be proxied.|/g/fetch|
 |```PROXY_IP_HEADER```|The header variable where the proxy will find the IP address of the user.|X-Forwarded-For|
 |```PROXY_IP_HEADER_INDEX```|The header variable value will be split by comma. With this variable you can set the index of the users IP.|0|
 |```ENABLE_SERVER_SIDE_GA_COOKIES```|If the proxy should transfer the client id to a serverside cookie, set this to true.|true|
